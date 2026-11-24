@@ -1,4 +1,4 @@
-// AutoClip Pro – UI (99Hertz hardware look: brushed panel, knurled dials, lit keys, LED screens)
+// AutoClip (Pro build) – UI (99Hertz hardware look: brushed panel, knurled dials, lit keys, LED screens)
 #include "PluginEditor.h"
 #include "BinaryData.h"
 #include <cmath>
@@ -244,13 +244,14 @@ public:
         if (b.getProperties().contains ("pill"))
         {
             const bool warnCol = (bool) b.getProperties()["warn"];
-            g.setFont (Fonts::led (11.5f, 0.1f));
+            g.setFont (Fonts::led (11.0f, 0.06f));
             g.setColour (warnCol ? Pal::warn : Pal::accent);
             g.drawText (b.getButtonText(), b.getLocalBounds(), juce::Justification::centred);
             return;
         }
         const bool locked = (bool) b.getProperties().getWithDefault ("locked", false);
         const bool on  = b.getToggleState() && ! locked;
+        const bool savedLocked = locked && (bool) b.getProperties().getWithDefault ("saved", false);   // upgrade setting saved in the project
         const bool lit = on || ((bool) b.getProperties().getWithDefault ("lit", false) && ! locked);
         auto r = b.getLocalBounds().toFloat().reduced (1.0f).withTrimmedBottom (3.0f);
         if (on || down) r.translate (0.0f, 2.0f);
@@ -264,13 +265,13 @@ public:
             g.fillRoundedRectangle (lamp.expanded (3.0f, 2.5f), 3.0f);
             g.setColour (Pal::accent);
         }
-        else g.setColour (Pal::lampOff);
+        else g.setColour (savedLocked ? Pal::silkLo : Pal::lampOff);
         g.fillRoundedRectangle (lamp, lh / 2);
 
         if (locked)
             padlock (g, { r.getRight() - 17.0f, r.getY() + 6.0f, 9.0f, 11.0f }, Pal::silkLo);
         g.setFont (Fonts::silkSemi (small ? 12.0f : 14.5f, 0.14f));
-        g.setColour (on ? juce::Colour (0xfff2f2ef) : Pal::silkMid.withAlpha (b.isEnabled() ? 1.0f : 0.5f));
+        g.setColour (on ? juce::Colour (0xfff2f2ef) : savedLocked ? Pal::silk.withAlpha (0.55f) : Pal::silkMid.withAlpha (b.isEnabled() ? 1.0f : 0.5f));
         g.drawText (b.getButtonText(), r.withTrimmedTop (lamp.getBottom() - r.getY()), juce::Justification::centred);
     }
 
@@ -300,6 +301,16 @@ void SegmentControl::showValue (int v)
     shown = v;
     for (int i = 0; i < buttons.size(); ++i)
         if (buttons[i]->getToggleState() != (i == v)) buttons[i]->setToggleState (i == v, juce::dontSendNotification);
+}
+
+void SegmentControl::markSaved (int value)
+{
+    for (int i = 0; i < buttons.size(); ++i)
+        if ((bool) buttons[i]->getProperties().getWithDefault ("saved", false) != (i == value))
+        {
+            buttons[i]->getProperties().set ("saved", i == value);
+            buttons[i]->repaint();
+        }
 }
 
 void SegmentControl::setLocked (int value, bool locked)
@@ -342,8 +353,10 @@ ProPanel::ProPanel (AutoClipProAudioProcessor& p) : proc (p)
     subscribe.setColour (juce::ToggleButton::textColourId, Pal::silkMid);
     subscribe.setColour (juce::ToggleButton::tickColourId, Pal::accent);
     subscribe.setColour (juce::ToggleButton::tickDisabledColourId, Pal::silkLo);
-    for (auto* c : std::initializer_list<juce::Component*> { &emailBox, &keyBox, &subscribe, &trialButton, &unlockButton, &buyButton, &closeButton })
+    for (auto* c : std::initializer_list<juce::Component*> { &emailBox, &keyBox, &subscribe, &trialButton, &unlockButton, &buyButton, &closeButton,
+                                                             &activateButton, &moveButton })
         addAndMakeVisible (c);
+    activateButton.getProperties().set ("lit", true);
     buyButton.getProperties().set ("lit", true);
     trialButton.getProperties().set ("lit", true);
 
@@ -352,23 +365,35 @@ ProPanel::ProPanel (AutoClipProAudioProcessor& p) : proc (p)
     {
         juce::URL ("https://99hertz.com/autoclip-pro?utm_source=plugin&utm_medium=autoclippro&utm_campaign=upgrade").launchInDefaultBrowser();
     };
+    // UNLOCK: a trial key is saved at once; a pro key activates this computer first (needs the internet once).
     unlockButton.onClick = [this]
     {
-        const auto info = proc.licence.apply (keyBox.getText());
-        if (info.unlocked())
+        busy = true; message = "ACTIVATING..."; messageIsError = false; refresh();
+        juce::Component::SafePointer<ProPanel> safe (this);
+        proc.licence.unlock (keyBox.getText(), [safe] (hz::LicenceInfo info, juce::String error)
         {
-            proc.setLicenceInfo (info);
-            message = info.kind == hz::LicenceInfo::pro ? "PRO UNLOCKED. THANK YOU!" : "PRO TRIAL UNLOCKED";
-            messageIsError = false;
-            keyBox.clear();
-            if (onLicenceChanged) onLicenceChanged();
-        }
-        else
+            if (safe == nullptr) return;
+            if (error.isEmpty() && info.unlocked()) safe->keyBox.clear();
+            safe->licenceResult (error, info.kind == hz::LicenceInfo::pro ? "UNLOCKED. THANK YOU!" : "TRIAL UNLOCKED");
+        });
+    };
+    activateButton.onClick = [this]
+    {
+        busy = true; message = "ACTIVATING..."; messageIsError = false; refresh();
+        juce::Component::SafePointer<ProPanel> safe (this);
+        proc.licence.activate ([safe] (hz::LicenceInfo, juce::String error)
         {
-            message = info.kind == hz::LicenceInfo::trialExpired ? "THAT TRIAL KEY HAS ENDED" : "THAT KEY ISN'T VALID FOR AUTOCLIP PRO";
-            messageIsError = true;
-        }
-        refresh();
+            if (safe != nullptr) safe->licenceResult (error, "ACTIVATED. THANK YOU!");
+        });
+    };
+    moveButton.onClick = [this]
+    {
+        busy = true; message = "MOVING..."; messageIsError = false; refresh();
+        juce::Component::SafePointer<ProPanel> safe (this);
+        proc.licence.deactivate ([safe] (hz::LicenceInfo, juce::String error)
+        {
+            if (safe != nullptr) safe->licenceResult (error, "DONE. PASTE YOUR KEY ON THE OTHER COMPUTER");
+        });
     };
     trialButton.onClick = [this]
     {
@@ -386,7 +411,7 @@ ProPanel::ProPanel (AutoClipProAudioProcessor& p) : proc (p)
             if (info.unlocked())
             {
                 safe->proc.setLicenceInfo (info);
-                safe->message = "PRO UNLOCKED FOR 7 DAYS. YOUR KEY IS ON ITS WAY BY EMAIL.";
+                safe->message = "UNLOCKED FOR 7 DAYS. YOUR KEY IS ON ITS WAY BY EMAIL.";
                 safe->messageIsError = false;
                 if (safe->onLicenceChanged) safe->onLicenceChanged();
             }
@@ -394,6 +419,28 @@ ProPanel::ProPanel (AutoClipProAudioProcessor& p) : proc (p)
             safe->refresh();
         });
     };
+}
+
+// After any licence request: re-read what's saved (the truth for this instance), then say how it went.
+void ProPanel::licenceResult (const juce::String& error, const juce::String& okMessage)
+{
+    busy = false;
+    proc.setLicenceInfo (proc.licence.check());
+    message = error.isNotEmpty() ? error.toUpperCase() : okMessage;
+    messageIsError = error.isNotEmpty();
+    if (onLicenceChanged) onLicenceChanged();
+    refresh();
+}
+
+void ProPanel::setMessage (const juce::String& text, bool isError)
+{
+    message = text; messageIsError = isError;
+    refresh();
+}
+
+void ProPanel::licenceChanged()
+{
+    if (isVisible()) refresh();
 }
 
 void ProPanel::show (const juce::String& why)
@@ -411,9 +458,12 @@ void ProPanel::refresh()
     const auto k = proc.licenceInfo.kind;
     const bool canTrial = k == hz::LicenceInfo::none || k == hz::LicenceInfo::invalid;
     const bool isPro = k == hz::LicenceInfo::pro;
+    const bool needsAct = k == hz::LicenceInfo::needsActivation;
     emailBox.setVisible (canTrial); subscribe.setVisible (canTrial); trialButton.setVisible (canTrial);
-    keyBox.setVisible (! isPro); unlockButton.setVisible (! isPro); buyButton.setVisible (! isPro);
-    trialButton.setEnabled (! busy);
+    keyBox.setVisible (! isPro && ! needsAct); unlockButton.setVisible (! isPro && ! needsAct); buyButton.setVisible (! isPro && ! needsAct);
+    activateButton.setVisible (needsAct); moveButton.setVisible (isPro);
+    for (auto* b : { &trialButton, &unlockButton, &activateButton, &moveButton }) b->setEnabled (! busy);
+    getProperties().set ("hzMessage", message);
     trialButton.setButtonText (busy ? "STARTING..." : "START 7-DAY FREE TRIAL");
     resized();
     repaint();
@@ -430,6 +480,8 @@ void ProPanel::resized()
     unlockButton.setBounds (x + w - 220, c.getY() + 316, 220, 46);
     buyButton.setBounds (x, c.getBottom() - 62, 220, 46);
     closeButton.setBounds (x + w - 120, c.getBottom() - 62, 120, 46);
+    activateButton.setBounds (x, c.getY() + 218, 280, 46);
+    moveButton.setBounds (x, c.getBottom() - 62, 270, 46);
 }
 
 void ProPanel::mouseDown (const juce::MouseEvent& e)
@@ -456,15 +508,18 @@ void ProPanel::paint (juce::Graphics& g)
     g.setFont (titleFont);
     g.setColour (Pal::silk);
     g.drawText ("AUTOCLIP", juce::Rectangle<float> (x, c.getY() + 38.0f, w, 34.0f), juce::Justification::centredLeft);
-    g.setColour (Pal::accent);
-    g.drawText ("PRO", juce::Rectangle<float> (x + textWidth (titleFont, "AUTOCLIP") + 9.0f, c.getY() + 38.0f, 80.0f, 34.0f), juce::Justification::centredLeft);
+    if (! proc.licenceInfo.isProKey())
+    {
+        g.setColour (Pal::accent);
+        g.drawText ("UPGRADE", juce::Rectangle<float> (x + textWidth (titleFont, "AUTOCLIP") + 10.0f, c.getY() + 38.0f, 200.0f, 34.0f), juce::Justification::centredLeft);
+    }
 
     const auto k = proc.licenceInfo.kind;
     juce::String sub = reason;
-    if (k == hz::LicenceInfo::trial)             sub = "PRO TRIAL: " + juce::String (proc.licenceInfo.daysLeft()) + (proc.licenceInfo.daysLeft() == 1 ? " DAY LEFT" : " DAYS LEFT");
+    if (k == hz::LicenceInfo::trial)             sub = "TRIAL: " + proc.licenceInfo.daysLeftText();
     else if (k == hz::LicenceInfo::trialExpired) sub = "YOUR FREE TRIAL HAS ENDED";
-    else if (k == hz::LicenceInfo::pro)          sub = "UNLOCKED FOR " + proc.licenceInfo.email.toUpperCase();
-    else if (sub.isEmpty())                      sub = "TRY EVERY PRO FEATURE FREE FOR 7 DAYS";
+    else if (proc.licenceInfo.isProKey())          sub = proc.licenceInfo.licensedText();
+    else if (sub.isEmpty())                      sub = "TRY EVERY UPGRADE FEATURE FREE FOR 7 DAYS";
     g.setFont (Fonts::led (14.0f, 0.08f));
     glowText (g, sub, { x, c.getY() + 78.0f, w, 18.0f }, juce::Justification::centredLeft, k == hz::LicenceInfo::trialExpired ? Pal::warn : Pal::accent);
 
@@ -486,14 +541,18 @@ void ProPanel::paint (juce::Graphics& g)
     g.setColour (Pal::silkMid);
     if (k == hz::LicenceInfo::none || k == hz::LicenceInfo::invalid)
         g.drawText ("NO CARD NEEDED. AFTER 7 DAYS IT GOES BACK TO FREE.", juce::Rectangle<float> (x, c.getY() + 200.0f, w, 14.0f), juce::Justification::centredLeft);
-    if (k != hz::LicenceInfo::pro)
+    if (k == hz::LicenceInfo::needsActivation)
+        g.drawText ("YOUR KEY IS SAVED. ONE CLICK TO ACTIVATE THIS COMPUTER.", juce::Rectangle<float> (x, c.getY() + 200.0f, w, 14.0f), juce::Justification::centredLeft);
+    if (! proc.licenceInfo.isProKey())
         g.drawText ("ALREADY BOUGHT IT? PASTE YOUR KEY", juce::Rectangle<float> (x, c.getY() + 302.0f, w, 14.0f), juce::Justification::centredLeft);
 
     if (message.isNotEmpty())
     {
-        g.setFont (Fonts::led (13.0f, 0.04f));
+        const bool longMsg = message.length() > 70;   // e.g. the server's "already in use on <computer>" message
+        g.setFont (Fonts::led (longMsg ? 11.5f : 13.0f, 0.04f));
         g.setColour (messageIsError ? Pal::warn : Pal::accent);
-        g.drawFittedText (message, juce::Rectangle<int> ((int) x, (int) c.getBottom() - 86, (int) w, 18), juce::Justification::centredLeft, 1);
+        g.drawFittedText (message, juce::Rectangle<int> ((int) x, (int) c.getBottom() - (longMsg ? 93 : 86), (int) w, longMsg ? 30 : 18),
+                          juce::Justification::centredLeft, longMsg ? 2 : 1);
     }
 }
 
@@ -639,7 +698,7 @@ AutoClipProAudioProcessorEditor::AutoClipProAudioProcessorEditor (AutoClipProAud
     typeKeys.allowValue = [this] (int v)
     {
         if (ac::gate::typeAllowed (v, proc.proUnlocked.load())) return true;
-        openPro (juce::String (ac::typeName (v)) + " IS A PRO CLIP TYPE");
+        openPro (juce::String (ac::typeName (v)) + " IS AN UPGRADE CLIP TYPE");
         return false;
     };
 
@@ -649,7 +708,7 @@ AutoClipProAudioProcessorEditor::AutoClipProAudioProcessorEditor (AutoClipProAud
 
     matchKey.setTooltip ("Turn the output down to the same loudness as the input, so you hear the clipping, not the volume");
     tpKey.setTooltip ("Also catch the peaks between samples (for streaming and MP3)");
-    tpKey.onLockedClick = [this] { openPro ("TRUE PEAK IS A PRO FEATURE"); };
+    tpKey.onLockedClick = [this] { openPro ("TRUE PEAK IS AN UPGRADE FEATURE"); };
     addAndMakeVisible (matchKey);
     addAndMakeVisible (tpKey);
 
@@ -663,10 +722,10 @@ AutoClipProAudioProcessorEditor::AutoClipProAudioProcessorEditor (AutoClipProAud
     addKnob ("protect", "LOW PROTECT", { "OFF", "60", "90", "120", "150", "AUTO" });
     addKnob ("quality", "QUALITY", { "OFF", "2X", "4X", "8X" });
     addKnob ("mix", "MIX");
-    knob ("ceiling")->slider.onLockedClick = [this] { openPro ("SETTING THE CEILING IS A PRO FEATURE"); };
-    knob ("protect")->slider.onLockedClick = [this] { openPro ("LOW PROTECT IS A PRO FEATURE"); };
-    knob ("quality")->slider.onLockedClick = [this] { openPro ("CHOOSING THE OVERSAMPLING IS A PRO FEATURE"); };
-    knob ("mix")->slider.onLockedClick     = [this] { openPro ("MIX IS A PRO FEATURE"); };
+    knob ("ceiling")->slider.onLockedClick = [this] { openPro ("SETTING THE CEILING IS AN UPGRADE FEATURE"); };
+    knob ("protect")->slider.onLockedClick = [this] { openPro ("LOW PROTECT IS AN UPGRADE FEATURE"); };
+    knob ("quality")->slider.onLockedClick = [this] { openPro ("CHOOSING THE OVERSAMPLING IS AN UPGRADE FEATURE"); };
+    knob ("mix")->slider.onLockedClick     = [this] { openPro ("MIX IS AN UPGRADE FEATURE"); };
 
     addChildComponent (proPanel);   // last, so it sits on top
     setSize (W, H);
@@ -763,8 +822,6 @@ void AutoClipProAudioProcessorEditor::renderBackground()
     g.setFont (logo);
     g.setColour (Pal::silk);
     g.drawText ("AUTOCLIP", padX, 50, 240, 36, juce::Justification::centredLeft);
-    g.setColour (Pal::accent);
-    g.drawText ("PRO", padX + (int) textWidth (logo, "AUTOCLIP") + 10, 50, 80, 36, juce::Justification::centredLeft);
 
     // Dividers
     g.setColour (juce::Colours::white.withAlpha (0.16f));
@@ -828,19 +885,13 @@ void AutoClipProAudioProcessorEditor::updateLocks()
     tpKey.setLocked (ac::gate::proTruePeak && ! pro);
 
     const auto& li = proc.licenceInfo;
-    juce::String t; bool warnCol = false;
-    switch (li.kind)
-    {
-        case hz::LicenceInfo::trial:        t = "PRO TRIAL: " + juce::String (li.daysLeft()) + (li.daysLeft() == 1 ? " DAY LEFT" : " DAYS LEFT"); break;
-        case hz::LicenceInfo::trialExpired: t = "TRIAL ENDED: GET PRO"; warnCol = true; break;
-        case hz::LicenceInfo::pro:          t = "PRO"; break;
-        default:                            t = "FREE: TRY PRO 7 DAYS"; break;
-    }
+    const auto t = li.buttonText();
+    const bool warnCol = li.kind == hz::LicenceInfo::trialExpired || li.kind == hz::LicenceInfo::needsActivation;
     if (licenceButton.getButtonText() != t || (bool) licenceButton.getProperties()["warn"] != warnCol || licenceButton.getWidth() == 0)
     {
         licenceButton.setButtonText (t);
         licenceButton.getProperties().set ("warn", warnCol);
-        const int w = (int) std::ceil (textWidth (Fonts::led (11.5f, 0.1f), t)) + 24;
+        const int w = (int) std::ceil (textWidth (Fonts::led (11.0f, 0.06f), t)) + 24;
         licenceButton.setBounds (padX, 88, w, 20);
         licenceButton.repaint();
     }
@@ -855,9 +906,23 @@ juce::Colour AutoClipProAudioProcessorEditor::heatColour() const
 
 void AutoClipProAudioProcessorEditor::timerCallback()
 {
+    if (const int v = proc.licenceVersion.load(); v != seenLicenceVersion)
+    {
+        seenLicenceVersion = v;   // another instance unlocked, a trial ended, or the panel saved a key
+        proPanel.licenceChanged();
+        repaint();
+    }
     const bool pro = proc.proUnlocked.load();
     const auto e = proc.resolve (pro);
     updateLocks();
+    upgradeNudge = ! pro && proc.usesUpgradeSettings();
+    {
+        // A locked type saved in the project shows greyed on its key (SOFT, which runs, stays lit).
+        const int savedType = juce::jlimit (0, ac::numTypes - 1, (int) proc.apvts.getRawParameterValue ("type")->load());
+        typeKeys.markSaved (ac::gate::typeAllowed (savedType, pro) ? -1 : savedType);
+        const bool tpSaved = tpKey.locked && proc.apvts.getRawParameterValue ("truepeak")->load() > 0.5f;
+        if ((bool) tpKey.getProperties().getWithDefault ("saved", false) != tpSaved) { tpKey.getProperties().set ("saved", tpSaved); tpKey.repaint(); }
+    }
     typeKeys.showValue (e.type);
     matchKey.showValue (e.match);
     tpKey.showValue (e.truePeak);
@@ -865,11 +930,11 @@ void AutoClipProAudioProcessorEditor::timerCallback()
     learnButton.getProperties().set ("lit", ! heard || proc.isListening());
     learnButton.repaint();
 
-    // Locked dials show what actually runs.
+    // Locked dials show what actually runs, or, greyed, an upgrade value saved in the project.
     auto setShown = [&] (const char* id, float norm)
     {
         auto* k = knob (id);
-        if (k->slider.locked) k->slider.getProperties().set ("displayPos", norm);
+        if (k->slider.locked && ! upgradeNudge) k->slider.getProperties().set ("displayPos", norm);
         else                  k->slider.getProperties().remove ("displayPos");
     };
     setShown ("ceiling", (e.ceilingDb - ac::ceilingMinDb) / -ac::ceilingMinDb);
@@ -884,6 +949,11 @@ void AutoClipProAudioProcessorEditor::timerCallback()
                             : "BELOW " + juce::String ((int) ac::protectStepsHz[e.protect]) + " HZ";
     knob ("quality")->value = e.osIndex == 0 ? juce::String ("OFF") : juce::String (ac::osFactors[e.osIndex]) + "X";
     knob ("mix")->value     = juce::String (juce::roundToInt (e.mix * 100.0f)) + " %";
+    if (upgradeNudge)   // locked dials holding a saved upgrade value: show that value (greyed)
+        for (auto* id : { "ceiling", "protect", "quality", "mix" })
+            if (auto* k = knob (id); k->slider.locked)
+                k->value = juce::String (id) == "mix" ? juce::String (juce::roundToInt (proc.apvts.getRawParameterValue (id)->load())) + " %"
+                         : proc.apvts.getParameter (id)->getCurrentValueAsText().toUpperCase() + (juce::String (id) == "ceiling" ? " DB" : "");
     scopeView.ceilingDb = e.ceilingDb;
 
     auto ballistic = [] (float& m, float v, float fall) { m = v > m ? v : m * fall + v * (1.0f - fall); };
@@ -918,6 +988,14 @@ void AutoClipProAudioProcessorEditor::timerCallback()
         ledRightText = mClip < 0.05f ? juce::String ("0.0") : juce::String (mClip, 1);
     }
 
+    ledWarn = false;
+    if (upgradeNudge && heard && ! proc.isListening())
+    {
+        ledWarn  = true;
+        ledLabel = "THIS PROJECT USES UPGRADE SETTINGS";
+        ledText  = "UPGRADE TO USE THEM AGAIN";
+    }
+
     scopeView.repaint();
     repaint (ledArea.expanded (12));
     repaint (meterArea.expanded (4));
@@ -938,11 +1016,12 @@ void AutoClipProAudioProcessorEditor::paint (juce::Graphics& g)
         float ls = 12.0f;
         while (ls > 9.0f && textWidth (Fonts::led (ls, 0.14f), ledLabel) > in.getWidth() - 6.0f) ls -= 0.5f;
         g.setFont (Fonts::led (ls, 0.14f));
-        glowText (g, ledLabel, in.removeFromTop (16.0f), juce::Justification::centredLeft, Pal::accent.withAlpha (0.75f));
+        const auto ledCol = ledWarn ? Pal::warn : Pal::accent;
+        glowText (g, ledLabel, in.removeFromTop (16.0f), juce::Justification::centredLeft, ledCol.withAlpha (0.75f));
         float fs = 21.0f;
         while (fs > 14.0f && textWidth (Fonts::led (fs, 0.04f), ledText) > in.getWidth() - 6.0f) fs -= 1.0f;
         g.setFont (Fonts::led (fs, 0.04f));
-        glowText (g, ledText, in, juce::Justification::centredLeft, Pal::accent);
+        glowText (g, ledText, in, juce::Justification::centredLeft, ledCol);
         g.setFont (Fonts::led (12.0f, 0.14f));
         glowText (g, ledRightLabel, right.removeFromTop (16.0f), juce::Justification::centredRight, Pal::accent.withAlpha (0.75f));
         g.setFont (Fonts::led (21.0f, 0.04f));
@@ -1001,7 +1080,7 @@ void AutoClipProAudioProcessorEditor::paint (juce::Graphics& g)
     };
     title ({ padX, 139, 96, 20 }, "TYPE", true, 0, false);
     title (secClip, "CLIP", true, 0, false);
-    title (secPro, "PRO", pro, 18, ! pro);
+    title (secPro, "EXTRAS", pro, 18, ! pro);
     title (secOut, "OUTPUT", true, 24, false);
 
     // ── Dial labels + values ──
@@ -1016,11 +1095,20 @@ void AutoClipProAudioProcessorEditor::paint (juce::Graphics& g)
         g.setColour (Pal::accent.withAlpha (k->slider.locked ? 0.7f : 1.0f));
         g.drawText (k->value, cell.translated (0, 17.0f), juce::Justification::centred);
     }
+    // Licensed: the licence email in small print beside the LICENSED pill.
+    if (proc.licenceInfo.kind == hz::LicenceInfo::pro && proc.licenceInfo.email.isNotEmpty())
+    {
+        const auto lb = licenceButton.getBounds();
+        g.setFont (Fonts::silkMed (12.0f, 0.04f));
+        g.setColour (Pal::silkMid);
+        g.drawFittedText (proc.licenceInfo.ownerText(), { lb.getRight() + 8, lb.getY(), ledArea.getX() - lb.getRight() - 16, lb.getHeight() },
+                          juce::Justification::centredLeft, 1, 0.8f);
+    }
     if (! pro)
     {
         g.setFont (Fonts::silkMed (12.0f, 0.06f));
         g.setColour (Pal::silkLo);
-        g.drawText ("Lite clips SOFT at -0.3 dB with 4x oversampling. Click a padlock to take control.",
+        g.drawText ("The free version clips SOFT at -0.3 dB with 4x oversampling. Click a padlock to take control.",
                     juce::Rectangle<int> (secClip.getX(), secClip.getBottom() - 20, secClip.getWidth() + secPro.getWidth(), 16),
                     juce::Justification::centred);
     }

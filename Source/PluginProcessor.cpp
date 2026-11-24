@@ -23,6 +23,20 @@ AutoClipProAudioProcessor::AutoClipProAudioProcessor()
     pTruePeak = apvts.getRawParameterValue ("truepeak");
     pMatch    = apvts.getRawParameterValue ("match");
     setLicenceInfo (licence.check());
+    licenceWatcher = std::make_unique<hz::LicenceWatcher> (licence, licenceInfo, [this] (const hz::LicenceInfo& i) { setLicenceInfo (i); });
+}
+
+bool AutoClipProAudioProcessor::usesUpgradeSettings() const
+{
+    using namespace ac::gate;
+    const int t = juce::jlimit (0, ac::numTypes - 1, (int) pType->load());
+    const int prot = (int) pProtect->load();
+    return proType[t]
+        || (proCeiling  && std::abs (pCeiling->load() - liteCeilingDb) > 0.05f)
+        || (proQuality  && (int) pQuality->load() != liteOsIndex)
+        || (proProtect  && prot != 0 && prot != ac::protectAuto)   // AUTO (the default) and OFF aren't choices the free version lacks
+        || (proMix      && pMix->load() < 99.95f)
+        || (proTruePeak && pTruePeak->load() > 0.5f);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout AutoClipProAudioProcessor::createParameterLayout()

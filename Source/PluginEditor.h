@@ -21,6 +21,7 @@ public:
     void resized() override;
     void setLocked (int value, bool locked);          // padlock on that key
     void showValue (int value);                       // which key is lit (the value that actually runs)
+    void markSaved (int value);                       // a locked key holding the project's saved value (-1 = none): drawn greyed
     std::function<bool (int value)> allowValue;       // return false to refuse a click (locked Pro value)
     int gap = 10;
 private:
@@ -62,12 +63,15 @@ class ProPanel : public juce::Component
 public:
     explicit ProPanel (AutoClipProAudioProcessor& p);
     void show (const juce::String& reason);
+    void licenceChanged();   // the processor's licence changed (another instance, trial expiry): redraw if open
     void paint (juce::Graphics&) override;
     void resized() override;
     void mouseDown (const juce::MouseEvent& e) override;   // click outside the card closes it
     std::function<void()> onLicenceChanged;
+    void setMessage (const juce::String& text, bool isError);   // (also used by the test renders)
 private:
     void refresh();
+    void licenceResult (const juce::String& error, const juce::String& okMessage);
     juce::Rectangle<int> card() const;
     AutoClipProAudioProcessor& proc;
     juce::String reason, message;
@@ -75,7 +79,8 @@ private:
     juce::TextEditor emailBox, keyBox;
     juce::ToggleButton subscribe { "Send me tips and offers" };
     juce::TextButton trialButton { "START 7-DAY FREE TRIAL" }, unlockButton { "UNLOCK" },
-                     buyButton { "BUY PRO" }, closeButton { "CLOSE" };
+                     buyButton { "UPGRADE" }, closeButton { "CLOSE" },
+                     activateButton { "ACTIVATE THIS COMPUTER" }, moveButton { "MOVE TO ANOTHER COMPUTER" };
 };
 
 // The hero display: the last 2 seconds of waveform going in (red where it's over the ceiling = what
@@ -131,6 +136,8 @@ private:
     juce::Rectangle<int> ledArea, meterArea, secType, secClip, secPro, secOut;
     juce::String ledLabel, ledText, ledRightLabel, ledRightText;
     float mIn = 0.0f, mOut = 0.0f, mClip = 0.0f, mLouder = 0.0f, mDist = -120.0f;
+    bool ledWarn = false, upgradeNudge = false;
+    int seenLicenceVersion = -1;
     int clipHeat = 0;                             // 0 clean, 1 audible, 2 hot (from the clipper's distortion)
     juce::Colour heatColour() const;
 

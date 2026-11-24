@@ -16,6 +16,7 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "../Source/PluginProcessor.h"
 #include "../Source/PluginEditor.h"
+#include "LicenceTests.h"
 #include <cmath>
 #include <map>
 
@@ -799,6 +800,17 @@ static void snapshots (const juce::File& outDir, const Buf& mix)
           { setParam (p, "amount", 7); setParam (p, "type", 3); setParam (p, "ceiling", -1); setParam (p, "protect", 3); setParam (p, "quality", 3); setParam (p, "mix", 85); setParam (p, "truepeak", 1); });
     snap ("ui-8-pro-panel.png", hz::LicenceInfo::pro, "", nullptr);
     snap ("ui-9-waiting.png", hz::LicenceInfo::none, nullptr, nullptr, false);
+    // Licence states (Launch prep renders)
+    auto saved = [] (APP& p) { setParam (p, "amount", 6); setParam (p, "type", 2); setParam (p, "ceiling", -3); setParam (p, "quality", 3); };
+    snap ("licence-1-free.png", hz::LicenceInfo::none, nullptr, [] (APP& p) { setParam (p, "amount", 6); });
+    snap ("licence-2-free-panel.png", hz::LicenceInfo::none, "", nullptr);
+    snap ("licence-3-trial.png", hz::LicenceInfo::trial, nullptr, [] (APP& p) { setParam (p, "amount", 8); setParam (p, "type", 1); });
+    snap ("licence-4-trial-panel.png", hz::LicenceInfo::trial, "", nullptr);
+    snap ("licence-5-trial-ended.png", hz::LicenceInfo::trialExpired, nullptr, [] (APP& p) { setParam (p, "amount", 6); });
+    snap ("licence-6-trial-ended-panel.png", hz::LicenceInfo::trialExpired, "", nullptr);
+    snap ("licence-7-licensed.png", hz::LicenceInfo::pro, nullptr, saved);
+    snap ("licence-8-licensed-panel.png", hz::LicenceInfo::pro, "", nullptr);
+    snap ("licence-9-saved-upgrade-settings.png", hz::LicenceInfo::trialExpired, nullptr, saved);
 }
 
 // ── Sound examples from real stems ───────────────────────────────────────────
@@ -1133,6 +1145,24 @@ int main (int argc, char** argv)
         check (info.kind == want, "key " + name + " -> " + kinds[(int) info.kind]);
     }
 
+    hztest::runLicenceTests<APP> ("autoclippro", [] (APP& p) { return p.proUnlocked.load(); });
+    hztest::renderLicenceStates<APP> ("autoclippro", outDir);
+    hztest::runSavedSettingsTests<APP> ([] (APP& p)
+    {
+        setParam (p, "type", 2); setParam (p, "ceiling", -3); setParam (p, "quality", 3);
+        setParam (p, "protect", 2); setParam (p, "mix", 70); setParam (p, "truepeak", 1);
+    });
+    {
+        // and the audio still falls back to free: no licence + saved upgrade settings = SOFT, -0.3 dB, 4x, full mix
+        APP p; p.setLicenceInfo ({});
+        setParam (p, "type", 2); setParam (p, "ceiling", -3); setParam (p, "mix", 70);
+        const auto e = p.resolve (p.proUnlocked.load());
+        hztest::expect (p.usesUpgradeSettings() && e.type == ac::soft && std::abs (e.ceilingDb - ac::gate::liteCeilingDb) < 0.01f && e.mix == 1.0f,
+                        "no licence + saved upgrade settings: flagged, plays as free");
+    }
+    hztest::finish();
+
+    failures += hztest::failures;
     std::printf ("\n%s: %d failure(s)\n", failures == 0 ? "ALL PASS" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }
