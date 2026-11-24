@@ -2,6 +2,7 @@
 // Usage:
 //   AutoClipProTest <outdir> [quick] [name=key ...]      all tests (+ UI snapshots in <outdir>)
 //   AutoClipProTest examples <outdir> <stems dir>         sound examples from real stems (loudness-matched)
+//   AutoClipProTest renderfile <in.wav> <out.wav> [k=v]   one file through the plug-in (measurements, see renderFile)
 //  - LOW PROTECT AUTO (crossover above the bass it hears), quiet-intro gain staging
 //  - latency + alignment of every QUALITY setting
 //  - output never above the ceiling (every type / quality / mix / protect / true peak)
@@ -426,7 +427,10 @@ static void protectTests()
             r[prot] = bassHarmonicsDb (run (*p, sig), f0);
         }
         std::printf ("  %-5s OFF %6.1f | 60 Hz %6.1f | 90 Hz %6.1f | 120 Hz %6.1f | 150 Hz %6.1f dB\n", ac::typeName (t), r[0], r[1], r[2], r[3], r[4]);
-        if (t == ac::hard) check (r[3] <= r[0] + 0.5, "HARD: LOW PROTECT 120 Hz is no worse (hard clipping only touches the spikes anyway)");
+        // HARD and the (tight-kneed) SOFT curve only touch the spikes, so the bass is clean with or without
+        // protection; TAPE and TUBE bend the whole wave and need it.
+        if (t == ac::hard || t == ac::soft)
+            check (r[3] <= -40.0 && r[3] <= r[0] + 3.5, juce::String (ac::typeName (t)) + ": bass harmonics stay under -40 dB with LOW PROTECT 120 Hz (" + juce::String (r[3], 1) + " dB, OFF " + juce::String (r[0], 1) + ")");
         else check (r[3] < r[0] - 6.0, juce::String (ac::typeName (t)) + ": LOW PROTECT 120 Hz cuts bass distortion by > 6 dB (" + juce::String (r[0] - r[3], 1) + " dB)");
     }
 }
@@ -504,7 +508,11 @@ static void protectAutoTests()
                 r[k] = bassHarmonicsDb (run (*p, sig), f0);
             }
             std::printf ("  %-5s 55 Hz bass: 60 Hz %6.1f | 120 Hz %6.1f | AUTO %6.1f dB\n", ac::typeName (t), r[0], r[1], r[2]);
-            check (r[2] <= r[1] + 1.0 && r[2] < r[0] - 6.0, juce::String (ac::typeName (t)) + ": AUTO keeps a 55 Hz bass as clean as 120 Hz, far cleaner than 60 Hz");
+            // (60 Hz used to be a trap here; since the room is measured on the real low band it isn't for
+            // SOFT/TUBE any more, but it still is for TAPE.)
+            check (r[2] <= r[1] + 1.0 && r[2] <= r[0] + 4.0 && r[2] < -45.0, juce::String (ac::typeName (t)) + ": AUTO keeps a 55 Hz bass as clean as 120 Hz, never worse than 60 Hz, under -45 dB ("
+                   + juce::String (r[2], 1) + " dB)");
+            if (t == ac::tape) check (r[2] < r[0] - 6.0, "TAPE: AUTO far cleaner than 60 Hz on a 55 Hz bass");
         }
     }
     // A saved session keeps its AUTO crossover; LEARN listens again
@@ -680,8 +688,8 @@ static void stateTests (const Buf& mix)
     b->requestLearn();
     run (*b, mix, BS * 4);
     check (b->isListening() || b->hasHeardSignal(), "LEARN listens again");
-    run (*b, mix, (int) (0.2 * SR));
-    check (b->hasHeardSignal() && ! b->isListening(), "and picks the peak back up after 100 ms (" + juce::String (b->getInputPeakDb(), 2) + " dB)");
+    run (*b, mix, (int) ((APP::learnSecs + 0.5) * SR));
+    check (b->hasHeardSignal() && ! b->isListening(), "and picks the peak back up after " + juce::String (APP::learnSecs, 0) + " s of signal (" + juce::String (b->getInputPeakDb(), 2) + " dB)");
 }
 
 // ── Lite gate ────────────────────────────────────────────────────────────────
@@ -857,9 +865,233 @@ static int examples (const juce::File& od, const juce::File& stems)
     return 0;
 }
 
+
+
+// ── LEARN ────────────────────────────────────────────────────────────────────
+// Plays `sig` through `p` block by block (the message thread's part of LEARN done after every block, like the
+// plug-in's async update). Returns the output; optionally the highest CLIP reading from sample `clipFrom`.
+static Buf play (APP& p, const Buf& sig, int len, float* maxClip = nullptr, int clipFrom = 0, std::vector<float>* staging = nullptr)
+{
+    Buf out (2, len), blk (2, BS); juce::MidiBuffer m;
+    const int n = sig.getNumSamples();
+    for (int pos = 0; pos < len; pos += BS)
+    {
+        const int k = juce::jmin (BS, len - pos);
+        blk.setSize (2, k, false, false, true);
+        for (int c = 0; c < 2; ++c) for (int i = 0; i < k; ++i) blk.setSample (c, i, sig.getSample (juce::jmin (c, sig.getNumChannels() - 1), (pos + i) % n));
+        p.processBlock (blk, m);
+        p.applyLearnedAmount();
+        for (int c = 0; c < 2; ++c) out.copyFrom (c, pos, blk, c, 0, k);
+        if (maxClip && pos >= clipFrom) *maxClip = juce::jmax (*maxClip, p.clipDb.load());
+        if (staging) staging->push_back (p.getStagingDb());
+    }
+    return out;
+}
+
+// Distortion residual: what's left of `y` after taking away `ref` (the same chain set so it doesn't clip:
+// identical latency and oversampling filters) times the best-matching gain over each 10 ms, vs the signal, dB.
+// The 10 ms gain follows level changes (the safety limiter riding a peak, a fader) but not the clipping
+// itself, which reshapes the waveform within a cycle: the same measure the reference renders use.
+static double residualDb (const Buf& y, const Buf& ref, int from, int to)
+{
+    const int W = juce::jmax (1, (int) (0.005 * SR)), n = to - from;
+    std::vector<double> yr ((size_t) n + 1, 0.0), rr ((size_t) n + 1, 0.0);
+    for (int i = 0; i < n; ++i)
+    {
+        double a = 0, b = 0;
+        for (int c = 0; c < 2; ++c) { a += (double) y.getSample (c, from + i) * ref.getSample (c, from + i); b += (double) ref.getSample (c, from + i) * ref.getSample (c, from + i); }
+        yr[(size_t) i + 1] = yr[(size_t) i] + a; rr[(size_t) i + 1] = rr[(size_t) i] + b;
+    }
+    double e = 0, sgl = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        const int a = juce::jmax (0, i - W), b = juce::jmin (n, i + W + 1);
+        const double den = rr[(size_t) b] - rr[(size_t) a];
+        const double g = den > 1e-20 ? (yr[(size_t) b] - yr[(size_t) a]) / den : 0.0;
+        for (int c = 0; c < 2; ++c)
+        {
+            const double r = g * ref.getSample (c, from + i), d = y.getSample (c, from + i) - r;
+            e += d * d; sgl += r * r;
+        }
+    }
+    return 10.0 * std::log10 (e / (sgl + 1e-30) + 1e-30);
+}
+
+static void learnTests()
+{
+    std::printf ("\n== LEARN: listens %.0f s of signal, then sets the level and a clean AMOUNT ==\n", APP::learnSecs);
+    {
+        auto p = makeProc (true);
+        check (std::abs (p->apvts.getRawParameterValue ("amount")->load() - ac::amountDefaultDb) < 1e-4f && ac::amountDefaultDb <= 2.0f,
+               "AMOUNT starts conservative (" + juce::String (ac::amountDefaultDb, 1) + " dB)");
+    }
+    // progress, silence doesn't count, the level holds still while it listens
+    {
+        auto mix = mixBus (12.0);
+        auto p = makeProc (true);
+        play (*p, mix, (int) (4 * SR));                        // already staged
+        const float before = p->getStagingDb();
+        Buf withGap (2, (int) (2 * SR) + mix.getNumSamples()); withGap.clear();
+        for (int c = 0; c < 2; ++c) withGap.copyFrom (c, (int) (2 * SR), mix, c, 0, mix.getNumSamples());
+        p->requestLearn();
+        std::vector<float> st;
+        play (*p, withGap, (int) (2 * SR), nullptr, 0, &st);
+        const float progSilent = p->getLearnProgress();
+        Buf rest (2, mix.getNumSamples()); for (int c = 0; c < 2; ++c) rest.copyFrom (c, 0, mix, c, 0, mix.getNumSamples());
+        play (*p, rest, (int) (3 * SR), nullptr, 0, &st);
+        const float progHalf = p->getLearnProgress(); const bool listening = p->isListening();
+        float drift = 0; for (float v : st) drift = juce::jmax (drift, std::abs (v - before));
+        play (*p, rest, (int) ((APP::learnSecs - 3.0 + 0.4) * SR), nullptr, 0, nullptr);
+        std::printf ("  progress after 2 s of silence %.2f, after 3 s of music %.2f; staging moved %.2f dB while listening; learned AMOUNT %.1f dB\n",
+                     progSilent, progHalf, drift, p->getLearnedAmountDb());
+        check (progSilent < 0.05f, "silence doesn't count towards LEARN");
+        check (listening && std::abs (progHalf - 3.0f / (float) APP::learnSecs) < 0.06f, "LEARN shows its progress (" + juce::String (progHalf * 100, 0) + " % after 3 s)");
+        check (drift < 0.05f, "the level holds still while LEARN listens (no dip, no jump)");
+        check (! p->isListening() && p->getLearnCount() == 1, "LEARN finishes after " + juce::String (APP::learnSecs, 0) + " s of music");
+        check (std::abs (p->apvts.getRawParameterValue ("amount")->load() - p->getLearnedAmountDb()) < 0.06f, "LEARN puts its AMOUNT on the dial");
+        check (p->getLearnedAmountDb() <= APP::learnMaxDb, "learned AMOUNT within " + juce::String (APP::learnMaxDb, 0) + " dB");
+        play (*p, rest, (int) (3 * SR));
+        check (p->clipDistDb.load() < APP::distCleanDb, "after LEARN the clip meter reads clean (" + juce::String (p->clipDistDb.load(), 1) + " dB)");
+    }
+    // LEARN in a quiet intro, then the drop comes in 24 dB louder: it meets the clipper at the same AMOUNT
+    {
+        auto drums = drumLoop (8.0); const float pk = samplePeak (drums);
+        Buf sig (2, 2 * drums.getNumSamples());
+        for (int c = 0; c < 2; ++c)
+        {
+            sig.copyFrom (c, 0, drums, c, 0, drums.getNumSamples());
+            sig.applyGain (c, 0, drums.getNumSamples(), juce::Decibels::decibelsToGain (-30.0f) / pk);
+            sig.copyFrom (c, drums.getNumSamples(), drums, c, 0, drums.getNumSamples());
+            sig.applyGain (c, drums.getNumSamples(), drums.getNumSamples(), juce::Decibels::decibelsToGain (-6.0f) / pk);
+        }
+        auto p = makeProc (true);
+        p->requestLearn();
+        float clipDrop = 0;
+        play (*p, sig, sig.getNumSamples(), &clipDrop, drums.getNumSamples());
+        std::printf ("  LEARN in a -30 dBFS intro, then a -6 dBFS drop: AMOUNT %.1f dB, highest CLIP after the drop %.2f dB\n", p->getLearnedAmountDb(), clipDrop);
+        check (clipDrop <= p->getLearnedAmountDb() + 0.3f, "a louder drop after LEARN doesn't slam the clipper (" + juce::String (clipDrop, 2) + " dB)");
+    }
+    // the meter goes hot when you push it
+    {
+        auto p = makeProc (true, [] (APP& a) { setParam (a, "amount", 12); });
+        play (*p, drumLoop (6.0), (int) (6 * SR));
+        check (p->clipDistDb.load() > APP::distHeavyDb, "AMOUNT 12 on drums: the clip meter reads hot (" + juce::String (p->clipDistDb.load(), 1) + " dB)");
+    }
+}
+
+// LEARN on Sam's real stems at typical Logic levels. The residual limit comes from the reference renders
+// (README in the comparison folder): FabFilter Pro-L 2 (Modern, 4x) pushed for +2 dB of loudness on the
+// drum loop leaves a -33 dB residual on this same measure; LEARN has to be at least that clean on every
+// stem, at every level, and may never clip the loudest peak by more than learnMaxDb.
+static void learnStemTests()
+{
+    const char* env = std::getenv ("AUTOCLIP_STEMS");
+    const juce::File root = env ? juce::File (juce::String (env)) : juce::File::getSpecialLocation (juce::File::userHomeDirectory).getChildFile ("99hertz/ads/how-to-make/out/stems");
+    const auto g = root.getChildFile ("gta6-01-stussy-ninety"), h = root.getChildFile ("90s-piano-house-15");
+    std::printf ("\n== LEARN on real stems (Logic levels; pass = AMOUNT <= %.0f dB, CLIP <= AMOUNT + 0.2 dB, residual <= %.0f dB) ==\n", APP::learnMaxDb, -33.0);
+    if (! g.getChildFile ("groove.wav").existsAsFile() || ! h.getChildFile ("piano.wav").existsAsFile())
+    { std::printf ("  (stems not found in %s: skipped)\n", root.getFullPathName().toRawUTF8()); return; }
+    const double keep = SR;
+    double rate = 44100;
+    auto ld = [&] (const juce::File& f) { return loadMono (f, rate); };
+    std::vector<std::pair<juce::String, Buf>> src;
+    auto groove = ld (g.getChildFile ("groove.wav")), hat = ld (g.getChildFile ("hat.wav")), bass = ld (g.getChildFile ("bass.wav")), synth = ld (g.getChildFile ("synth.wav"));
+    auto piano = ld (h.getChildFile ("piano.wav")), pbass = ld (h.getChildFile ("bass.wav")), vocal = ld (h.getChildFile ("vocal.wav"));
+    SR = rate;
+    auto sum = [] (std::initializer_list<const Buf*> bs) { Buf o (**bs.begin()); bool first = true; for (auto* b : bs) { if (first) { first = false; continue; } for (int c = 0; c < 2; ++c) o.addFrom (c, 0, *b, c, 0, juce::jmin (o.getNumSamples(), b->getNumSamples())); } return o; };
+    src = { { "gta groove", groove }, { "gta hat", hat }, { "gta bass", bass }, { "gta synth", synth }, { "gta drums (groove+hat)", sum ({ &groove, &hat }) },
+            { "gta full mix", sum ({ &groove, &hat, &bass, &synth }) }, { "piano-house piano", piano }, { "piano-house bass", pbass },
+            { "piano-house vocal", vocal }, { "piano-house mix", sum ({ &piano, &pbass, &vocal }) } };
+    float worstRes = -200, worstOver = -100, worstAmt = 0;
+    for (auto& [name, raw] : src)
+    {
+        const bool full = name.contains ("drums") || name.contains ("mix");
+        for (float peakDb : { -18.0f, -12.0f, -6.0f })
+        {
+            if (! full && peakDb != -12.0f) continue;
+            Buf sig (raw); sig.applyGain (juce::Decibels::decibelsToGain (peakDb) / samplePeak (raw));
+            const int n = sig.getNumSamples();
+            auto p = makeProc (true);                                          // Pro defaults, like Sam's session
+            auto r = makeProc (true, [] (APP& a) { setParam (a, "type", 1); setParam (a, "amount", 0); setParam (a, "ceiling", 0); setParam (a, "protect", 0); });
+            p->requestLearn(); r->requestLearn();
+            float maxClip = 0;
+            const auto y = play (*p, sig, 2 * n, &maxClip, n);                  // second time round the loop
+            Buf ry (2, 2 * n), blk (2, BS); juce::MidiBuffer m;                // reference: same chain, no clipping (AMOUNT stays 0)
+            for (int pos = 0; pos < 2 * n; pos += BS)
+            {
+                const int k = juce::jmin (BS, 2 * n - pos); blk.setSize (2, k, false, false, true);
+                for (int c = 0; c < 2; ++c) for (int i = 0; i < k; ++i) blk.setSample (c, i, sig.getSample (c, (pos + i) % n));
+                r->processBlock (blk, m);
+                for (int c = 0; c < 2; ++c) ry.copyFrom (c, pos, blk, c, 0, k);
+            }
+            const double res = residualDb (y, ry, n, 2 * n);
+            Buf seg (2, n), dry (2, n);
+            for (int c = 0; c < 2; ++c) { seg.copyFrom (c, 0, y, c, n, n); dry.copyFrom (c, 0, sig, c, 0, n); }
+            const double gain = lufs (seg) - (lufs (dry) + (-0.3 - juce::Decibels::gainToDecibels (samplePeak (dry))));
+            const float amt = p->getLearnedAmountDb();
+            std::printf ("  %-24s %5.0f dBFS: AMOUNT %.1f dB, CLIP max %.2f dB, %+.2f dB louder than peak-normalised, residual %6.1f dB, meter %6.1f dB\n",
+                         name.toRawUTF8(), peakDb, amt, maxClip, gain, res, p->clipDistDb.load());
+            worstRes = juce::jmax (worstRes, (float) res); worstOver = juce::jmax (worstOver, maxClip - amt); worstAmt = juce::jmax (worstAmt, amt);
+            check (amt <= APP::learnMaxDb && maxClip <= amt + 0.2f && res <= -33.0,
+                   "LEARN on " + name + " at " + juce::String (peakDb, 0) + " dBFS: clean (" + juce::String (res, 1) + " dB, " + juce::String (amt, 1) + " dB AMOUNT)");
+        }
+    }
+    std::printf ("  worst: residual %.1f dB, AMOUNT %.1f dB, CLIP over AMOUNT %+.2f dB\n", worstRes, worstAmt, worstOver);
+    SR = keep;
+}
+
+// ── Render one file (for measurements against other plug-ins) ────────────────
+// AutoClipProTest renderfile <in.wav> <out.wav> [peak=-12] [amount=3] [type=0] [protect=5] [quality=2] [ceiling=-0.3]
+//                 [mix=100] [tp=0] [match=0] [pro=1] [learn=<sec>] [loops=2] [log=<csv>]
+// The input is scaled to `peak` dBFS (sample peak), played `loops` times back to back (like a looping DAW
+// region); LEARN is pressed at `learn` seconds. The output is latency-compensated, same length.
+static int renderFile (int argc, char** argv)
+{
+    std::map<juce::String, juce::String> kv;
+    for (int a = 4; a < argc; ++a) { const juce::String s (argv[a]); kv[s.upToFirstOccurrenceOf ("=", false, false)] = s.fromFirstOccurrenceOf ("=", false, false); }
+    auto num = [&] (const char* k, double def) { return kv.count (k) ? kv[k].getDoubleValue() : def; };
+    double rate = 44100;
+    auto x = loadMono (juce::File (juce::String (argv[2])), rate);
+    if (x.getNumSamples() == 0) return 1;
+    SR = rate;
+    if (kv.count ("peak")) x.applyGain (juce::Decibels::decibelsToGain ((float) num ("peak", -12)) / juce::jmax (1.0e-9f, samplePeak (x)));
+    const int loops = (int) num ("loops", 2), n1 = x.getNumSamples(), n = n1 * loops;
+    auto p = makeProc (num ("pro", 1) > 0.5, [&] (APP& a)
+    {
+        for (auto [k, id] : { std::pair<const char*, const char*> { "amount", "amount" }, { "type", "type" }, { "protect", "protect" }, { "quality", "quality" },
+                              { "ceiling", "ceiling" }, { "mix", "mix" }, { "tp", "truepeak" }, { "match", "match" } })
+            if (kv.count (k)) setParam (a, id, (float) num (k, 0));
+    });
+    const int L = p->getLatencySamples();
+    const int learnAt = kv.count ("learn") ? (int) (num ("learn", 0) * rate) : -1;
+    std::unique_ptr<juce::FileOutputStream> log;
+    if (kv.count ("log")) { juce::File lf (kv["log"]); lf.deleteFile(); log = lf.createOutputStream(); }
+    if (log) log->writeText ("t,staging,clip,ref,listening,amount,dist\n", false, false, nullptr);
+    Buf out (2, n + L), blk (2, BS); juce::MidiBuffer m;
+    for (int pos = 0; pos < n + L; pos += BS)
+    {
+        const int len = juce::jmin (BS, n + L - pos);
+        blk.setSize (2, len, false, false, true);
+        if (learnAt >= 0 && pos <= learnAt && learnAt < pos + BS) p->requestLearn();
+        for (int c = 0; c < 2; ++c) for (int i = 0; i < len; ++i) blk.setSample (c, i, pos + i < n ? x.getSample (c, (pos + i) % n1) : 0.0f);
+        p->processBlock (blk, m);
+        p->applyLearnedAmount();                  // what the message thread does when LEARN finishes
+        for (int c = 0; c < 2; ++c) out.copyFrom (c, pos, blk, c, 0, len);
+        if (log) log->writeText (juce::String (pos / rate, 4) + "," + juce::String (p->getStagingDb(), 3) + "," + juce::String (p->clipDb.load(), 3) + ","
+                                 + juce::String (p->getInputPeakDb(), 3) + "," + juce::String ((int) p->isListening()) + ","
+                                 + juce::String (p->apvts.getRawParameterValue ("amount")->load(), 2) + "," + juce::String (p->clipDistDb.load(), 2) + "\n", false, false, nullptr);
+    }
+    Buf al (2, n);
+    for (int c = 0; c < 2; ++c) al.copyFrom (c, 0, out, c, L, n);
+    writeWav (juce::File (juce::String (argv[3])), al, rate);
+    return 0;
+}
+
 int main (int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI init;
+    if (argc > 3 && juce::String (argv[1]) == "renderfile")
+        return renderFile (argc, argv);
     if (argc > 3 && juce::String (argv[1]) == "examples")
         return examples (juce::File (juce::String (argv[2])), juce::File (juce::String (argv[3])));
 
@@ -876,6 +1108,8 @@ int main (int argc, char** argv)
     protectTests();
     protectAutoTests();
     introTests();
+    learnTests();
+    learnStemTests();
     clickTests();
     stateTests (mix);
     liteTests (drums);

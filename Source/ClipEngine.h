@@ -33,14 +33,24 @@ inline float shape (int type, float u)
         // late and firmly: even (2nd) harmonics at every drive, like a single-ended triode.
         // The DC this makes is removed after the clipper.
         case tube: return u >= 0.0f ? 0.85f * kneeClip (a / 0.85f, 0.5f) : -kneeClip (a, 0.85f);
-        // Soft: a smooth (analytic) knee: -0.02 dB at half the threshold, -1 dB at the threshold. No corner
-        // anywhere, so the harmonics die away fast and there's very little left to alias.
+        // Soft: a smooth (analytic) knee that leaves everything under the top 3 dB alone: -0.01 dB at -3 dB,
+        // -0.08 dB at -2 dB, -0.3 dB at the threshold, then flattens to it. No corner anywhere, so the
+        // harmonics die away fast and there's very little left to alias (4x: under -70 dBc on a 7 kHz sine).
+        // (The old, wider knee bent the top 6 dB of every hit: at the same loudness it measured 3-4 dB
+        // dirtier than a plain clipper on real drums.)
         default:
         {
-            const float u2 = u * u, u6 = u2 * u2 * u2;
-            return u / std::pow (1.0f + u6, 1.0f / 6.0f);
+            const float u2 = u * u, u4 = u2 * u2, u10 = u4 * u4 * u2;
+            return u / std::pow (1.0f + u10, 0.1f);
         }
     }
+}
+
+// LOW PROTECT: how much protection, from the held low-band peak as a fraction of the ceiling.
+// Plain clipping while the lows are under -20 dB of the ceiling, full protection over -12 dB.
+inline float protectBlend (float lowFrac)
+{
+    return juce::jlimit (0.0f, 1.0f, (lowFrac - 0.1f) / 0.15f);
 }
 
 // ── Filters ──────────────────────────────────────────────────────────────────

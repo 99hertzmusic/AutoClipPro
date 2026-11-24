@@ -130,7 +130,9 @@ private:
     juce::Image background;
     juce::Rectangle<int> ledArea, meterArea, secType, secClip, secPro, secOut;
     juce::String ledLabel, ledText, ledRightLabel, ledRightText;
-    float mIn = 0.0f, mOut = 0.0f, mClip = 0.0f, mLouder = 0.0f;
+    float mIn = 0.0f, mOut = 0.0f, mClip = 0.0f, mLouder = 0.0f, mDist = -120.0f;
+    int clipHeat = 0;                             // 0 clean, 1 audible, 2 hot (from the clipper's distortion)
+    juce::Colour heatColour() const;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AutoClipProAudioProcessorEditor)
 };

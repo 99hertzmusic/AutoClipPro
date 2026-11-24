@@ -22,7 +22,7 @@ inline constexpr int numOsSteps = 4, numProtectSteps = 5;
 inline constexpr int   protectAuto = numProtectSteps, numProtectChoices = numProtectSteps + 1;
 inline constexpr float autoMinHz = 60.0f, autoMaxHz = 150.0f, autoDefaultHz = 120.0f, autoRatio = 2.0f;
 
-inline constexpr float amountMaxDb = 12.0f, amountDefaultDb = 3.0f;
+inline constexpr float amountMaxDb = 12.0f, amountDefaultDb = 1.5f;
 inline constexpr float ceilingMinDb = -12.0f;
 
 // ── THE LITE / PRO SPLIT ──────────────────────────────────────────────────────

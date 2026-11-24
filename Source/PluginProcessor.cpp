@@ -77,7 +77,10 @@ void AutoClipProAudioProcessor::Path::prepare (double rate, int exp, int maxBloc
     for (int k = 1; k < numProtectSteps; ++k)
         for (int c = 0; c < 2; ++c)
             for (int s = 0; s < 2; ++s)
+            {
                 hp[k][c][s].setHighPass (osRate, protectStepsHz[k], 0.7071067811865476);
+                lp[k][c][s].setLowPass  (osRate, protectStepsHz[k], 0.7071067811865476);
+            }
     envRel = (float) std::exp (-1.0 / (0.010 * osRate));
     for (auto& d : dc) d.prepare (osRate);
 }
@@ -88,13 +91,17 @@ void AutoClipProAudioProcessor::Path::setAutoHz (float hz)
     autoHz = hz;
     for (int c = 0; c < 2; ++c)
         for (int s = 0; s < 2; ++s)
+        {
             hp[protectAuto][c][s].setHighPass (osRate, hz, 0.7071067811865476);
+            lp[protectAuto][c][s].setLowPass  (osRate, hz, 0.7071067811865476);
+        }
 }
 
 void AutoClipProAudioProcessor::Path::reset()
 {
     if (os) os->reset();
     for (auto& a : hp) for (auto& b : a) for (auto& f : b) f.reset();
+    for (auto& a : lp) for (auto& b : a) for (auto& f : b) f.reset();
     for (auto& a : env) for (auto& v : a) v = 0.0f;
     for (auto& d : dc) d.reset();
     for (auto& d : pad) d.reset();
@@ -131,6 +138,9 @@ void AutoClipProAudioProcessor::prepareToPlay (double sampleRate, int)
     bassFinder.prepare (sr);
     osFadeStep  = (float) (1.0 / (0.03 * sr));
     listenLen   = juce::jmax (1, (int) (0.1 * sr));
+    learnLen    = juce::jmax ((juce::int64) 1, (juce::int64) (learnSecs * sr));
+    learnHoldLen = juce::jmax (1, (int) (0.25 * sr));
+    lEnvRel = (float) std::exp (-1.0 / (0.010 * sr)); lHz = 0.0f;
     cfgFadeStep = (float) (1.0 / (0.03 * sr));
     scopeHop = juce::jmax (1, (int) (0.005 * sr));
     sAmount.reset (sr, 0.05); sCeilDb.reset (sr, 0.1); sMix.reset (sr, 0.08);
@@ -149,7 +159,8 @@ void AutoClipProAudioProcessor::reset()
     { const float c0 = dbToGain (e.ceilingDb); for (int i = 0; i < maxPathLat; ++i) cDelay.process (c0); limiter.reset (c0); }
     for (auto& k : kIn) k.reset();
     for (auto& k : kOut) k.reset();
-    pIn = pOut = 0.0; matchGain = 1.0f; settled = false; listenLeft = 0;
+    pIn = pOut = 0.0; matchGain = 1.0f; settled = false; listenLeft = 0; learnLeft = 0;
+    distE = distS = 0.0;
     sAmount.setCurrentAndTargetValue (e.amountDb);
     sCeilDb.setCurrentAndTargetValue (e.ceilingDb);
     sMix.setCurrentAndTargetValue (e.mix);
@@ -175,6 +186,56 @@ bool AutoClipProAudioProcessor::isBusesLayoutSupported (const BusesLayout& layou
 
 void AutoClipProAudioProcessor::requestLearn() { learnRequest.store (true); }
 
+// LEARN has listened: stage the loudest peak at the ceiling and work out the clean AMOUNT for this material.
+// The clipping error for a drive of D dB over the loudest peak is predicted from the level histogram
+// (hard-clip error energy vs signal energy); LEARN takes the most drive that keeps it under learnCleanDb,
+// capped at learnMaxDb. Dense material (a hat loop, a busy drum bus) gets less, sparse peaks get more.
+// On the real stems in Test/Main.cpp (learnStemTests) this lands at 0.5-3 dB of AMOUNT and a -35 to -43 dB residual.
+void AutoClipProAudioProcessor::finishLearn()
+{
+    learnLeft = 0;
+    heard = learnPeak > dbToGain (-50.0f);
+    if (! heard) return;
+    refLin = learnPeak;
+    heardSamples = trustSamples;                  // LEARN heard the track: no quiet-intro cap
+    const float peakDb = gainToDb (learnPeak);
+    const double sig = learnSumSq / ((double) learnPeak * learnPeak);
+    float chosen = 0.0f;
+    for (int step = (int) std::lround (learnMaxDb * 10.0f); step >= 0; --step)
+    {
+        const float d = 0.1f * (float) step;
+        double err = 0.0;
+        const int b0 = juce::jlimit (0, histBins - 1, (int) std::floor ((peakDb - d - histLoDb) * 10.0f));
+        for (int b = b0; b < histBins; ++b)
+        {
+            if (learnHist[(size_t) b] == 0) continue;
+            const double lvl = (double) histLoDb + (b + 0.5) * 0.1 - peakDb + d;   // dB vs the clip threshold
+            if (lvl <= 0.0) continue;
+            const double over = std::pow (10.0, lvl / 20.0) - 1.0;
+            err += learnHist[(size_t) b] * over * over;
+        }
+        const double ratio = err / (sig * std::pow (10.0, d / 10.0) + 1.0e-30);
+        if (ratio <= std::pow (10.0, learnCleanDb / 10.0)) { chosen = d; break; }
+    }
+    learnedAmountOut.store (chosen);
+    learnVersion.fetch_add (1);
+    triggerAsyncUpdate();                          // the dial moves on the message thread
+}
+
+bool AutoClipProAudioProcessor::applyLearnedAmount()
+{
+    const int v = learnVersion.load();
+    if (v == appliedLearnVersion) return false;
+    appliedLearnVersion = v;
+    if (auto* prm = apvts.getParameter ("amount"))
+    {
+        prm->beginChangeGesture();
+        prm->setValueNotifyingHost (prm->convertTo0to1 (learnedAmountOut.load()));
+        prm->endChangeGesture();
+    }
+    return true;
+}
+
 // A restored session: same learned peak (full gain staging straight away) and the same AUTO crossover.
 void AutoClipProAudioProcessor::applyRestore()
 {
@@ -192,12 +253,20 @@ inline float AutoClipProAudioProcessor::clipOne (Path& P, int ch, float x, Confi
     // LOW PROTECT: only the band above the crossover (LR4 high-pass) is clipped, and only to whatever room
     // the rest of the signal leaves under the ceiling, so the kick and bass waveform go through untouched.
     // Only the change the clipper makes is added back (y = x + clipped high - high): nothing is phase-shifted
-    // when nothing is clipped. A last stage with a late knee catches the rare peak where the lows alone
-    // reach the ceiling.
+    // when nothing is clipped. A last stage with a late knee (linear up to 90 % of the ceiling, so a bass
+    // under that is never touched) catches the rare peak where the lows alone reach the ceiling.
+    // Protection only matters when there's real low end near the top: with the lows under -20 dB of the
+    // ceiling the bass can't be what gets clipped, and the high band alone (phase-shifted by the crossover)
+    // peaks up to 1 dB higher than the whole signal, so clipping it would cost more than it saves. AUTO
+    // therefore blends from plain clipping (lows under -20 dB) to full protection (lows over -12 dB).
+    const float yFull = c * shape (cfg.type, x / c);
+    const float a = protectBlend (P.env[cfg.protect][ch] / c);
+    if (a <= 0.0f) return yFull;
     const float rest = lows[cfg.protect], high = x - rest;
     const float th = juce::jmax (c - P.env[cfg.protect][ch], 0.25f * c);
     const float y = rest + th * shape (cfg.type, high / th);
-    return c * std::copysign (kneeClip (std::abs (y) / c, 0.9f), y);
+    const float yProt = c * std::copysign (kneeClip (std::abs (y) / c, 0.9f), y);
+    return yFull + (yProt - yFull) * a;
 }
 
 void AutoClipProAudioProcessor::runPath (Path& P, float* const* io, int n, Config cur, Config prev)
@@ -217,7 +286,11 @@ void AutoClipProAudioProcessor::runPath (Path& P, float* const* io, int n, Confi
             for (int k = 1; k < numProtectChoices; ++k)
             {
                 lows[k] = x - P.hp[k][ch][1].process (P.hp[k][ch][0].process (x));   // everything but the high band
-                P.env[k][ch] = juce::jmax (std::abs (lows[k]), P.env[k][ch] * P.envRel);
+                // The room the lows take is measured on the real low band. (x minus the high band isn't the lows:
+                // around the crossover it holds most of the low mids too, phase-shifted, which used to squeeze the
+                // room for the high band down to the 25 % floor on any piano, synth or vocal: constant crunch.)
+                const float low = P.lp[k][ch][1].process (P.lp[k][ch][0].process (x));
+                P.env[k][ch] = juce::jmax (std::abs (low), P.env[k][ch] * P.envRel);
             }
             float y = clipOne (P, ch, x, cur, c, lows);
             if (f < 1.0f)
@@ -226,6 +299,7 @@ void AutoClipProAudioProcessor::runPath (Path& P, float* const* io, int n, Confi
                 y = yp + (y - yp) * f;
             }
             // Remove DC from what the clipper changed only (TUBE is asymmetric); the clean signal keeps its phase.
+            P.errE += (double) (y - x) * (y - x); P.sigE += (double) x * x;
             d[j] = x + dc.process (y - x);
         }
     }
@@ -258,14 +332,15 @@ void AutoClipProAudioProcessor::processChunk (float* const* io, int numCh, int n
         applyRestore();
         if (heard) stagingDb = juce::jlimit (-24.0f, 24.0f, sCeilDb.getCurrentValue() - gainToDb (refLin));
     }
-    // LEARN: listen to the next 100 ms and take its loudest peak; the gain staging holds still meanwhile
-    // (no dip, no jump), then glides to the new value.
-    // LEARN also means "this is my material": the boost cap for a fresh instance is lifted, and LOW PROTECT
-    // AUTO listens for the bass again.
+    // LEARN: listen to learnSecs of signal (silence doesn't count), then stage the loudest peak at the ceiling
+    // and set a clean AMOUNT (finishLearn). The gain staging holds still meanwhile (no dip, no jump; a louder
+    // peak still turns it down), then glides to the new value at 12 dB/s at most.
+    // LEARN also means "this is my material": once it has listened, the boost cap for a fresh instance is
+    // lifted, and LOW PROTECT AUTO listens for the bass again.
     if (learnRequest.exchange (false))
     {
-        listenLeft = listenLen; candidate = 0.0f;
-        heardSamples = trustSamples; bassFinder.reset(); restoredAutoHz = 0.0f;
+        learnLeft = learnLen; learnHold = 0; lHz = 0.0f; learnPeak = 0.0f; learnSumSq = 0.0; learnHist.fill (0);
+        listenLeft = 0; bassFinder.reset(); restoredAutoHz = 0.0f;
     }
 
     // Locked features fall back to their Lite values, so automation or an old session can't bypass the lock.
@@ -289,6 +364,16 @@ void AutoClipProAudioProcessor::processChunk (float* const* io, int numCh, int n
 
     const bool twoPaths = nextPath >= 0;
     const float heardGate = dbToGain (-50.0f);
+    // LEARN's view of LOW PROTECT (same crossover as the clipper, at the base rate)
+    const float protHz = e.protect == 0 ? 0.0f : e.protect == protectAuto ? autoHzCur : protectStepsHz[e.protect];
+    if (learnLeft > 0 && protHz > 0.0f && std::abs (protHz - lHz) > 0.01f)
+    {
+        if (lHz <= 0.0f) { for (auto& a : lHp) for (auto& f : a) f.reset(); for (auto& a : lLp) for (auto& f : a) f.reset(); lEnv[0] = lEnv[1] = 0.0f; }
+        lHz = protHz;
+        for (int ch = 0; ch < 2; ++ch)
+            for (int st = 0; st < 2; ++st) { lHp[ch][st].setHighPass (sr, lHz, 0.7071067811865476); lLp[ch][st].setLowPass (sr, lHz, 0.7071067811865476); }
+    }
+    if (protHz <= 0.0f) lHz = 0.0f;
     float blkIn = 0.0f;
 
     // Pass 1 (base rate): gain staging, ceiling, dry delay, input loudness.
@@ -297,10 +382,40 @@ void AutoClipProAudioProcessor::processChunk (float* const* io, int numCh, int n
         const float x0 = io[0][i], x1 = numCh > 1 ? io[1][i] : x0;
         const float pk = juce::jmax (std::abs (x0), std::abs (x1));
         blkIn = juce::jmax (blkIn, pk);
-        if (listenLeft > 0)
+        bool newPeak = false;
+        if (learnLeft > 0)
+        {
+            if (heard && pk > refLin) { refLin = pk; newPeak = true; }   // a louder peak still turns the gain down right away
+            // Only time with music counts: from a sound over the gate until 0.25 s after the last one
+            // (so the quiet between hits counts, a stopped transport or a silent intro doesn't).
+            if (pk > heardGate) learnHold = learnHoldLen;
+            if (learnHold > 0)
+            {
+                --learnHold;
+                learnPeak = juce::jmax (learnPeak, pk);
+                learnSumSq += (double) pk * pk;
+                float lv = pk;
+                if (lHz > 0.0f)
+                {
+                    lv = 0.0f;
+                    for (int ch = 0; ch < 2; ++ch)
+                    {
+                        const float xc = ch == 0 ? x0 : x1;
+                        const float hi = lHp[ch][1].process (lHp[ch][0].process (xc));
+                        const float lo = lLp[ch][1].process (lLp[ch][0].process (xc));
+                        lEnv[ch] = juce::jmax (std::abs (lo), lEnv[ch] * lEnvRel);
+                        const float a = protectBlend (lEnv[ch] / learnPeak);   // vs the loudest peak so far (= the ceiling once staged)
+                        lv = juce::jmax (lv, std::abs (xc) + (std::abs (hi) + lEnv[ch] - std::abs (xc)) * a);
+                    }
+                }
+                if (lv > 1.0e-5f) ++learnHist[(size_t) juce::jlimit (0, histBins - 1, (int) ((gainToDb (lv) - histLoDb) * 10.0f))];
+                if (--learnLeft == 0) finishLearn();
+            }
+        }
+        else if (listenLeft > 0)
         {
             candidate = juce::jmax (candidate, pk);
-            if (heard && pk > refLin) refLin = pk;            // a louder peak still turns the gain down right away
+            if (heard && pk > refLin) { refLin = pk; newPeak = true; }   // a louder peak still turns the gain down right away
             if (--listenLeft == 0)
             {
                 heard = candidate > heardGate;
@@ -308,14 +423,18 @@ void AutoClipProAudioProcessor::processChunk (float* const* io, int numCh, int n
             }
         }
         else if (! heard) { if (pk > heardGate) { listenLeft = listenLen; candidate = pk; } }   // first sound: listen 100 ms
-        else if (pk > refLin) refLin = pk;
+        else if (pk > refLin) { refLin = pk; newPeak = true; }
 
         const float ceilDb = sCeilDb.getNextValue();
         if (heard && heardSamples < trustSamples && pk > heardGate) ++heardSamples;
         const float cap = heardSamples >= trustSamples ? 24.0f
                         : capStartDb + (24.0f - capStartDb) * (float) heardSamples / (float) trustSamples;
         const float target = heard ? juce::jlimit (-24.0f, cap, ceilDb - gainToDb (refLin)) : 0.0f;
-        if (target < stagingDb) stagingDb += (target - stagingDb) * stAttack;
+        // A louder peak than any heard so far: down at once, on that sample, so it meets the clipper at the
+        // same AMOUNT as every other peak (a 2 ms glide let the first hit of a louder drop slam in up to
+        // 20 dB hot). Any other drop (LEARN, the ceiling) glides.
+        if (newPeak && target < stagingDb) stagingDb = target;
+        else if (target < stagingDb) stagingDb += (target - stagingDb) * stAttack;
         else                    stagingDb += juce::jmin ((target - stagingDb) * stRelease, stUpMax);
         bassFinder.push (0.5f * (x0 + x1));
         const float g = dbToGain (stagingDb + sAmount.getNextValue());
@@ -398,7 +517,17 @@ void AutoClipProAudioProcessor::processChunk (float* const* io, int numCh, int n
     }
     if (twoPaths && osFade >= 1.0f) { curPath = nextPath; nextPath = -1; }
 
+    // Distortion meter: clipper change vs signal, ~0.5 s.
+    {
+        auto& P = paths[(size_t) curPath];
+        const double k = std::exp (-(double) n / (0.5 * sr));
+        distE = distE * k + P.errE; distS = distS * k + P.sigE;
+        for (auto& q : paths) q.errE = q.sigE = 0.0;   // (the other chain, if QUALITY was crossfading)
+        clipDistDb.store (distS > 1.0e-9 ? (float) (10.0 * std::log10 (distE / distS + 1.0e-12)) : -120.0f);
+    }
+
     inPeak.store (blkIn); outPeak.store (blkOut); clipDb.store (gainToDb (blkClip));
+    { float h = clipHoldDb.load(); const float v = gainToDb (blkClip); while (v > h && ! clipHoldDb.compare_exchange_weak (h, v)) {} }
     louderDb.store (pIn > 1.0e-12 && pOut > 1.0e-12 ? (float) (10.0 * std::log10 (pOut / pIn)) : 0.0f);
     matchDb.store (gainToDb (matchGain));
     ceilingNow.store (cArr[(size_t) (n - 1)]);
@@ -406,7 +535,8 @@ void AutoClipProAudioProcessor::processChunk (float* const* io, int numCh, int n
     stagingOut.store (stagingDb);
     autoHzOut.store (autoHzCur);
     heardOut.store (heard);
-    listeningOut.store (listenLeft > 0);
+    listeningOut.store (listenLeft > 0 || learnLeft > 0);
+    learnProgOut.store (learnLeft > 0 ? 1.0f - (float) learnLeft / (float) learnLen : 0.0f);
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────

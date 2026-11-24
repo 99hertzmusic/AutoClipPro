@@ -643,7 +643,7 @@ AutoClipProAudioProcessorEditor::AutoClipProAudioProcessorEditor (AutoClipProAud
         return false;
     };
 
-    learnButton.setTooltip ("Forget the loudest peak and listen again");
+    learnButton.setTooltip ("Listen to 6 seconds of the track, then set the level and a clean AMOUNT for it");
     learnButton.onClick = [this] { proc.requestLearn(); };
     addAndMakeVisible (learnButton);
 
@@ -846,6 +846,13 @@ void AutoClipProAudioProcessorEditor::updateLocks()
     }
 }
 
+// CLIP meter colour: cream while the clipping is clean, orange once it's audible on exposed material,
+// red when it's hot (thresholds in the processor: distCleanDb / distHeavyDb).
+juce::Colour AutoClipProAudioProcessorEditor::heatColour() const
+{
+    return clipHeat == 2 ? Pal::accent : clipHeat == 1 ? Pal::warn : Pal::level;
+}
+
 void AutoClipProAudioProcessorEditor::timerCallback()
 {
     const bool pro = proc.proUnlocked.load();
@@ -882,17 +889,21 @@ void AutoClipProAudioProcessorEditor::timerCallback()
     auto ballistic = [] (float& m, float v, float fall) { m = v > m ? v : m * fall + v * (1.0f - fall); };
     ballistic (mIn, proc.inPeak.load(), 0.86f);
     ballistic (mOut, proc.outPeak.load(), 0.86f);
-    ballistic (mClip, juce::jmax (0.0f, proc.clipDb.load()), 0.90f);
+    ballistic (mClip, juce::jmax (0.0f, proc.clipHoldDb.exchange (0.0f)), 0.90f);   // every peak since the last frame
+    mDist += (proc.clipDistDb.load() - mDist) * 0.2f;
+    // Honest clip colour: what the clipper is doing to the sound, not just how far over the peaks go.
+    clipHeat = mDist > APP::distHeavyDb ? 2 : mDist > APP::distCleanDb ? 1 : 0;
     mLouder += (proc.louderDb.load() - mLouder) * 0.15f;
 
     // LED
     const auto dot = juce::String::fromUTF8 (" \xc2\xb7 ");
     ledLabel = juce::String (ac::typeName (e.type)) + dot + (e.osIndex == 0 ? juce::String ("NO OVERSAMPLING") : juce::String (ac::osFactors[e.osIndex]) + "X OVERSAMPLED")
              + dot + "CEILING " + juce::String (e.ceilingDb, 1);
-    ledRightLabel = "CLIP";
+    ledRightLabel = clipHeat == 2 ? "HOT" : clipHeat == 1 ? "AUDIBLE" : "CLIP";
     if (proc.isListening())
     {
-        ledText = juce::String::fromUTF8 ("LISTENING\xe2\x80\xa6");
+        const float prog = proc.getLearnProgress();
+        ledText = juce::String::fromUTF8 ("LISTENING\xe2\x80\xa6") + (prog > 0.0f ? " " + juce::String (juce::roundToInt (prog * 100.0f)) + "%" : juce::String());
         ledRightText = "--";
     }
     else if (! heard)
@@ -935,7 +946,7 @@ void AutoClipProAudioProcessorEditor::paint (juce::Graphics& g)
         g.setFont (Fonts::led (12.0f, 0.14f));
         glowText (g, ledRightLabel, right.removeFromTop (16.0f), juce::Justification::centredRight, Pal::accent.withAlpha (0.75f));
         g.setFont (Fonts::led (21.0f, 0.04f));
-        glowText (g, ledRightText, right, juce::Justification::centredRight, Pal::accent);
+        glowText (g, ledRightText, right, juce::Justification::centredRight, heatColour());
     }
 
     // ── Meters: IN / CLIP / OUT ──
@@ -966,6 +977,7 @@ void AutoClipProAudioProcessorEditor::paint (juce::Graphics& g)
                 const bool on = s < lit;
                 auto col = Pal::accent;
                 if (! rows[i].clip && s >= segs - 2) col = Pal::warn;   // last 6 dB before 0 dBFS
+                if (rows[i].clip) col = heatColour();                    // clean / audible / hot
                 if (on) { g.setColour (col.withAlpha (0.22f)); g.fillRect (sr.expanded (1.5f)); }
                 g.setColour (on ? col : Pal::accent.withAlpha (0.08f));
                 g.fillRect (sr);

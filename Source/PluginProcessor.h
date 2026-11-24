@@ -10,15 +10,16 @@
 #include "Licence/Licence.h"
 
 // AutoClip Pro: the automatic clipper.
-//  Lite (free): AMOUNT, automatic gain staging (learns the track's loudest peak; LEARN to start again),
+//  Lite (free): AMOUNT, automatic gain staging (learns the track's loudest peak; LEARN listens 6 s and sets the
+//  level and a clean AMOUNT for the track),
 //  SOFT clip at a fixed -0.3 dB ceiling with 4x oversampling, MATCH (hear it at the same level), the clip display.
 //  Pro (key or 7-day trial): HARD / TAPE / TUBE, CEILING, LOW PROTECT, QUALITY (oversampling), MIX, TRUE PEAK.
 //  The split itself lives in Features.h (ac::gate).
-class AutoClipProAudioProcessor : public juce::AudioProcessor
+class AutoClipProAudioProcessor : public juce::AudioProcessor, private juce::AsyncUpdater
 {
 public:
     AutoClipProAudioProcessor();
-    ~AutoClipProAudioProcessor() override = default;
+    ~AutoClipProAudioProcessor() override { cancelPendingUpdate(); }
 
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override {}
@@ -66,15 +67,29 @@ public:
     Effective resolve (bool pro) const;
 
     // ── Auto gain staging (the learned loudest input peak) ──────────────────
-    void requestLearn();                         // LEARN key: forget the peak and listen again
+    // LEARN key: forget the peak, listen to learnSecs of signal, then set the gain staging AND put the clean
+    // AMOUNT for this material on the dial (the most clipping that stays clean, never more than learnMaxDb).
+    void requestLearn();
     bool  hasHeardSignal() const { return heardOut.load(); }
     bool  isListening() const    { return listeningOut.load(); }
+    float getLearnProgress() const { return learnProgOut.load(); }    // 0..1 while LEARN listens
+    float getLearnedAmountDb() const { return learnedAmountOut.load(); }
+    int   getLearnCount() const { return learnVersion.load(); }       // LEARNs finished so far
+    bool  applyLearnedAmount();                  // message thread: puts the AMOUNT LEARN found on the dial (once per LEARN)
+    static constexpr double learnSecs = 6.0;     // signal LEARN listens to (silence doesn't count)
+    static constexpr float  learnMaxDb = 3.0f;   // LEARN never asks for more clipping than this on the loudest peak
+    static constexpr float  learnCleanDb = -40.0f;   // ...and keeps the clipping error this far under the signal
     float getInputPeakDb() const { return refDbOut.load(); }
     float getAutoProtectHz() const { return autoHzOut.load(); }   // LOW PROTECT AUTO: the crossover running now
     float getStagingDb() const   { return stagingOut.load(); }    // gain staging applied now (before AMOUNT)
 
     // ── Meters / display for the editor ────────────────────────────────────
     std::atomic<float> inPeak { 0.0f }, outPeak { 0.0f }, clipDb { 0.0f };
+    // How much the clipper changes the signal (error energy vs signal, dB, ~0.5 s): what you'd hear as distortion.
+    std::atomic<float> clipDistDb { -120.0f };
+    std::atomic<float> clipHoldDb { 0.0f };      // highest CLIP since the editor last read it (exchange it to 0)
+    // Meter colours: clean under -30 dB (no dirtier than Pro-L 2 at +2.5 dB on a drum loop), audible to -20 dB, then hot.
+    static constexpr float distCleanDb = -30.0f, distHeavyDb = -20.0f;
     std::atomic<float> louderDb { 0.0f };        // output vs input loudness (before MATCH), K-weighted, ~3 s
     std::atomic<float> matchDb { 0.0f };         // gain MATCH is applying
     std::atomic<float> ceilingNow { 0.0f };      // linear ceiling actually running
@@ -92,6 +107,8 @@ private:
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     void processChunk (float* const* io, int numCh, int n);
     void applyRestore();
+    void finishLearn();
+    void handleAsyncUpdate() override { applyLearnedAmount(); }
 
     // One oversampling chain (OFF / 2x / 4x / 8x). All four are built in prepareToPlay; one runs
     // (two while QUALITY crossfades). Latency is padded to the slowest chain so it never changes.
@@ -100,11 +117,13 @@ private:
         int factor = 1, exponent = 0, lat = 0;
         std::unique_ptr<juce::dsp::Oversampling<float>> os;
         ac::Biquad hp[ac::numProtectChoices][2][2];  // LOW PROTECT crossovers (LR4 high-pass), [step][ch][stage]; last = AUTO
+        ac::Biquad lp[ac::numProtectChoices][2][2];  // the real low band (LR4 low-pass): only measures how much room the lows take
         float env[ac::numProtectChoices][2] {};
         double osRate = 44100.0; float autoHz = 0.0f;
         void setAutoHz (float hz);
         float envRel = 0.999f;
         ac::DcBlock dc[2];
+        double errE = 0.0, sigE = 0.0;               // clipper change / signal energy, this chunk (meter)
         ac::Delay pad[2];
         void prepare (double sr, int exp, int chunk);
         void reset();
@@ -143,6 +162,19 @@ private:
     std::atomic<float> refRestoreDb { 0.0f }; std::atomic<bool> refRestoreHeard { false };
     std::atomic<float> refDbOut { -120.0f }; std::atomic<bool> heardOut { false }, listeningOut { false };
     std::atomic<float> stagingOut { 0.0f };
+
+    // LEARN: a level histogram (0.1 dB bins, dBFS) of what it heard, to work out how much clipping stays clean.
+    static constexpr int histBins = 1300; static constexpr float histLoDb = -100.0f;
+    std::array<int, histBins> learnHist {};
+    double learnSumSq = 0.0;
+    // With LOW PROTECT on, only the high band is clipped, into the room the lows leave: what LEARN histograms
+    // is then |high band| + the held low-band peak (the level that actually meets the clipper).
+    ac::Biquad lHp[2][2], lLp[2][2]; float lEnv[2] {}, lEnvRel = 0.999f, lHz = 0.0f;
+    juce::int64 learnLeft = 0, learnLen = 1; int learnHold = 0, learnHoldLen = 12000;
+    float learnPeak = 0.0f;
+    std::atomic<float> learnProgOut { 0.0f }, learnedAmountOut { 0.0f };
+    std::atomic<int> learnVersion { 0 }; int appliedLearnVersion = 0;
+    double distE = 0.0, distS = 0.0;
 
     // LOW PROTECT AUTO
     ac::BassFinder bassFinder;
